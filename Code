@@ -1,0 +1,247 @@
+/*****************************************************
+COCOA YIELD PREDICTION (GHANA) — FULL PIPELINE (GEE)
+Steps 1–4 with time split validation (Train: 2000–2018, Test: 2019–2023)
+Author: You
+*****************************************************/
+
+/* ===========================
+   [CONFIG]
+=========================== */
+// EDIT THIS to your uploaded FAOSTAT table asset ID:
+var FAOSTAT_ASSET = 'projects/elemental-vent-469411-t2/assets/FAOSTSTDATA';
+
+var START_YEAR   = 2000;
+var END_YEAR     = 2023;
+var TRAIN_END_YR = 2018;  // inclusive
+var TEST_START_YR= 2019;  // inclusive
+
+/* ===========================
+   [AOI: GHANA GEOMETRY]
+=========================== */
+var ghana = ee.FeatureCollection('FAO/GAUL_SIMPLIFIED_500m/2015/level0')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Ghana'))
+  .geometry();
+
+/* ===========================
+   [DATASETS]
+=========================== */
+// Rainfall (mm/day), daily cadence
+var CHIRPS = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY'); // band: 'precipitation'
+// ERA5-Land monthly air temperature (Kelvin)
+var ERA5M  = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY').select('temperature_2m');
+// MODIS NDVI 16-day, scaled 0.0001
+var MODIS  = ee.ImageCollection('MODIS/061/MOD13Q1').select('NDVI');
+
+/* ===========================
+   [STEP 1] LABELS FROM FAOSTAT
+   - Build yearly yield = Production / Area
+=========================== */
+print('===== STEP 1: LABELS (FAOSTAT) =====');
+var COL_AREA='Area', COL_ITEM='Item', COL_ELEMENT='Element', COL_YEAR='Year', COL_VALUE='Value';
+
+var fao = ee.FeatureCollection(FAOSTAT_ASSET)
+  .filter(ee.Filter.eq(COL_AREA, 'Ghana'))
+  .filter(ee.Filter.or(
+    ee.Filter.eq(COL_ITEM, 'Cocoa beans'),
+    ee.Filter.eq(COL_ITEM, 'Cocoa, beans')
+  ));
+
+var prod = fao.filter(ee.Filter.eq(COL_ELEMENT, 'Production'))
+  .map(function(f){ return f.set('production_t', ee.Number(f.get(COL_VALUE)))
+                        .select([COL_YEAR, 'production_t']); });
+
+var area = fao.filter(ee.Filter.eq(COL_ELEMENT, 'Area harvested'))
+  .map(function(f){ return f.set('area_ha', ee.Number(f.get(COL_VALUE)))
+                        .select([COL_YEAR, 'area_ha']); });
+
+var joinedLabels = ee.Join.inner().apply({
+  primary: prod,
+  secondary: area,
+  condition: ee.Filter.equals({leftField: COL_YEAR, rightField: COL_YEAR})
+});
+
+var labels = ee.FeatureCollection(joinedLabels.map(function(j){
+  var L = ee.Feature(j.get('primary'));
+  var R = ee.Feature(j.get('secondary'));
+  var yr = ee.Number(L.get(COL_YEAR));
+  var p  = ee.Number(L.get('production_t'));
+  var a  = ee.Number(R.get('area_ha'));
+  return ee.Feature(null, {
+    year: yr,
+    production_t: p,
+    area_ha: a,
+    yield_t_ha: p.divide(a)
+  });
+}))
+.filter(ee.Filter.gte('year', START_YEAR))
+.filter(ee.Filter.lte('year', END_YEAR))
+.sort('year');
+
+print('Labels preview (year, prod, area, yield):', labels.limit(5));
+
+/* ===========================
+   [STEP 2] FEATURE WINDOWS (PHENOLOGY)
+   - May–Aug: rainfall sum & temp mean (flowering/pod set)
+   - Aug–Oct: NDVI mean (pod filling)
+=========================== */
+print('===== STEP 2: SEASONAL WINDOWS =====');
+function safeReduce(ic, start, end, reducer, outName, scaleMul, offsetSub) {
+  var sub = ic.filterBounds(ghana).filterDate(start, end);
+  var img = ee.Image(ee.Algorithms.If(
+    sub.size().gt(0),
+    sub.reduce(reducer),
+    ee.Image.constant(ee.Number(0).divide(0)) // NaN fallback
+  ));
+  if (scaleMul)  img = img.multiply(scaleMul);
+  if (offsetSub) img = img.subtract(offsetSub);
+  return img.rename(outName);
+}
+
+function seasonalForYear(y){
+  y = ee.Number(y);
+  var mjja_start = ee.Date.fromYMD(y, 5, 1), mjja_end = ee.Date.fromYMD(y, 9, 1);  // May–Aug
+  var ao_start   = ee.Date.fromYMD(y, 8, 1), ao_end   = ee.Date.fromYMD(y,11, 1);  // Aug–Oct
+
+  var rain_MJJA = safeReduce(CHIRPS, mjja_start, mjja_end, ee.Reducer.sum(),  'rain_MJJA',   null,    null);
+  var t2m_MJJA  = safeReduce(ERA5M,  mjja_start, mjja_end, ee.Reducer.mean(), 't2m_MJJA',    null,    273.15);
+  var ndvi_AO   = safeReduce(MODIS,  ao_start,   ao_end,   ee.Reducer.mean(), 'ndvi_AugOct', 0.0001,  null);
+
+  var img  = rain_MJJA.addBands(t2m_MJJA).addBands(ndvi_AO);
+  var dict = ee.Dictionary(img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: ghana,
+    scale: 5000,
+    maxPixels: 1e13
+  }));
+
+  return ee.Feature(null, {
+    year: y,
+    rain_MJJA:   dict.get('rain_MJJA'),
+    t2m_MJJA:    dict.get('t2m_MJJA'),
+    ndvi_AugOct: dict.get('ndvi_AugOct')
+  });
+}
+
+/* ===========================
+   [STEP 3] BUILD SEASONAL FEATURES & JOIN WITH LABELS
+=========================== */
+print('===== STEP 3: FEATURES + JOIN =====');
+var years    = ee.List.sequence(START_YEAR, END_YEAR);
+var seasonal = ee.FeatureCollection(years.map(seasonalForYear)).sort('year');
+print('Seasonal features preview (per year):', seasonal.limit(5));
+
+var training = ee.FeatureCollection(labels.map(function(f){
+  var yr = ee.Number(f.get('year'));
+  var feat = seasonal.filter(ee.Filter.eq('year', yr)).first();
+  return ee.Algorithms.If(
+    feat,
+    f.set({
+      rain_MJJA:   ee.Number(feat.get('rain_MJJA')),
+      t2m_MJJA:    ee.Number(feat.get('t2m_MJJA')),
+      ndvi_AugOct: ee.Number(feat.get('ndvi_AugOct'))
+    }),
+    null
+  );
+})).filter(ee.Filter.notNull(['yield_t_ha','rain_MJJA','t2m_MJJA','ndvi_AugOct']))
+  .sort('year');
+
+print('Training table (joined):', training.limit(10));
+
+/* ===========================
+   [STEP 4] MODEL + VALIDATION (TIME SPLIT)
+   - Random Forest (regression)
+   - Train: 2000–2018, Test: 2019–2023
+   - Metrics: R², RMSE, MAE, Dir Hit-Rate
+=========================== */
+print('===== STEP 4: MODEL + VALIDATION =====');
+var FEATURES = ['rain_MJJA','t2m_MJJA','ndvi_AugOct'];
+var LABEL    = 'yield_t_ha';
+
+// Split
+var trainFC = training.filter(ee.Filter.lte('year', TRAIN_END_YR));
+var testFC  = training.filter(ee.Filter.gte('year', TEST_START_YR));
+print('Train years:', trainFC.aggregate_array('year'));
+print('Test years :', testFC.aggregate_array('year'));
+
+// RF Regressor
+var rf = ee.Classifier.smileRandomForest({numberOfTrees: 500}).setOutputMode('REGRESSION');
+var rfTrained = rf.train({features: trainFC, classProperty: LABEL, inputProperties: FEATURES});
+
+// Predict on TEST
+var testPred = testFC.classify(rfTrained, 'pred_yield').map(function(f){
+  var resid = ee.Number(f.get('pred_yield')).subtract(ee.Number(f.get(LABEL)));
+  return f.set('resid', resid);
+}).sort('year');
+
+print('Test predictions preview:', testPred.limit(10));
+
+// Metrics on TEST
+var nTest = testPred.size();
+var yMuTest = ee.Number(testPred.aggregate_mean(LABEL));
+
+var SSE = ee.Number(testPred.aggregate_array('resid')
+  .map(function(r){ r = ee.Number(r); return r.multiply(r); })
+  .reduce(ee.Reducer.sum()));
+var SST = ee.Number(testPred.aggregate_array(LABEL)
+  .map(function(y){ y = ee.Number(y); return y.subtract(yMuTest).pow(2); })
+  .reduce(ee.Reducer.sum()));
+
+var R2_test   = ee.Algorithms.If(SST.neq(0), ee.Number(1).subtract(SSE.divide(SST)), ee.Number(0));
+var RMSE_test = SSE.divide(nTest).sqrt();
+var MAE_test  = ee.Number(testPred.aggregate_array('resid')
+  .map(function(r){ return ee.Number(r).abs(); })
+  .reduce(ee.Reducer.mean()));
+
+// Directional hit-rate on TEST
+var sorted = testPred.sort('year');
+var yList  = ee.List(sorted.aggregate_array(LABEL));
+var pList  = ee.List(sorted.aggregate_array('pred_yield'));
+var idx    = ee.List.sequence(1, yList.size().subtract(1));
+var hits   = idx.map(function(i){
+  i = ee.Number(i);
+  var dy = ee.Number(yList.get(i)).subtract(ee.Number(yList.get(i.subtract(1))));
+  var dp = ee.Number(pList.get(i)).subtract(ee.Number(pList.get(i.subtract(1))));
+  return dy.multiply(dp).gt(0); // same sign?
+});
+var DirHitRate_test = ee.Number(
+  ee.Algorithms.If(idx.length().gt(0), ee.Number(hits.reduce(ee.Reducer.mean())), ee.Number(0))
+);
+
+print('TEST Metrics (2019–2023):', ee.Dictionary({
+  R2: R2_test, RMSE: RMSE_test, MAE: MAE_test, Direction_HitRate: DirHitRate_test
+}));
+
+// Feature importance
+print('RF feature importance:', ee.Dictionary(rfTrained.explain().get('importance')));
+
+// Charts (TEST only)
+var outTable = testPred.select(['year', LABEL, 'pred_yield'].concat(FEATURES));
+
+var ts = ui.Chart.feature.byFeature(outTable, 'year', [LABEL, 'pred_yield'])
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Ghana Cocoa Yield — Test (2019–2023): Actual vs Predicted (RF)',
+    hAxis: {title: 'Year'},
+    vAxis: {title: 'Yield (t/ha)'},
+    pointSize: 4
+  });
+print(ts);
+
+var scatter = ui.Chart.feature.byFeature(outTable, LABEL, 'pred_yield')
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'Observed vs Predicted (Test 2019–2023)',
+    hAxis: {title: 'Observed (t/ha)'},
+    vAxis: {title: 'Predicted (t/ha)'},
+    trendlines: {0: {type: 'linear', color: 'grey', opacity: 0.6}}
+  });
+print(scatter);
+
+// Export TEST predictions CSV
+Export.table.toDrive({
+  collection: outTable,
+  description: 'ghana_predictions_RF_TEST_2019_2023',
+  fileFormat: 'CSV'
+});
+
+print('===== DONE: Check console for metrics/charts & Tasks for CSV export. =====');
