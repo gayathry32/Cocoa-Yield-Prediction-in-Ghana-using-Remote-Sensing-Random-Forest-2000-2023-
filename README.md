@@ -1,0 +1,2 @@
+# Cocoa-Yield-Prediction-in-Ghana-using-Remote-Sensing-Random-Forest-2000-2023-
+Cocoa yield prediction for Ghana (2000–2023) using FAOSTAT data with CHIRPS rainfall, ERA5 temperature, and MODIS NDVI. Features aligned to cocoa phenology and modeled via Random Forest with time-based validation (train: 2000–2018, test: 2019–2023). Achieved ~62% R², supporting early warning and trading signal applications.
